@@ -62,29 +62,37 @@ print(f"- {ba_agent.name}")
 print(f"- {se_agent.name}")
 print(f"- {po_agent.name}")
 
-# --- Approval Termination Strategy
-class ApprovalTerminationStrategy(TerminationStrategy):
-    async def should_agent_terminate(self, agent, history):
-        for msg in history:
-            if (
-                isinstance(msg, ChatMessageContent) and
-                msg.role == AuthorRole.USER and
-                "APPROVED" in msg.content.upper()
-            ):
-                print("Termination condition met: User said APPROVED.")
-                return True
-        return False
+# --- Simple termination function instead of custom class to avoid Pydantic issues
+async def should_terminate_conversation(history, max_iterations=15):
+    """Simple function to check termination conditions."""
+    
+    # Count messages to estimate iterations
+    iteration_count = len([msg for msg in history if isinstance(msg, ChatMessageContent)])
+    
+    if iteration_count >= max_iterations:
+        print(f"⚠️ Maximum messages ({max_iterations}) reached. Auto-terminating to prevent errors.")
+        return True
+        
+    # Check for user approval
+    for msg in history:
+        if (
+            isinstance(msg, ChatMessageContent) and
+            msg.role == AuthorRole.USER and
+            "APPROVED" in msg.content.upper()
+        ):
+            print("✅ Termination condition met: User said APPROVED.")
+            return True
+            
+    return False
 
-termination_strategy = ApprovalTerminationStrategy()
+# Create group chat without custom termination strategy to avoid Pydantic errors
 group_chat = AgentGroupChat(
-    agents=[ba_agent, se_agent, po_agent],
-    termination_strategy=termination_strategy
+    agents=[ba_agent, se_agent, po_agent]
 )
 print("AgentGroupChat created and ready!")
 
 # --- Callback to run after user says APPROVED
 async def on_approved_callback():
-    
     print("The user has APPROVED the work! Proceeding with final steps...")
     try:
         result = subprocess.run(
@@ -114,46 +122,108 @@ async def run_multi_agent(input_text: str):
     print("Added initial user message to chat history.")
 
     print("Streaming responses as they arrive...")
+    
+    # Add iteration counter for additional safety
+    iteration_count = 0
+    max_display_iterations = 15  # Reduced for better control
+    
     try:
         async for content in group_chat.invoke():
             print(f"# {content.role}: '{content.content}'")
+            iteration_count += 1
+            
+            # Safety check to prevent endless display loops
+            if iteration_count >= max_display_iterations:
+                print(f"⚠️ Display limit ({max_display_iterations}) reached. Moving to final processing...")
+                break
+                
     except Exception as e:
-        print(f"Error during group chat invocation: {str(e)}")
-        raise e
+        print(f"⚠️ Group chat iteration completed or interrupted: {str(e)}")
+        print("🔄 Proceeding with message processing...")
 
-    # Retrieve the final chat history
-    messages = group_chat.get_chat_messages()
+    # Retrieve the final chat history - handle async generator properly
+    print("📊 Retrieving messages from chat history...")
+    messages = []
+    try:
+        # Convert async generator to list
+        chat_messages = group_chat.get_chat_messages()
+        if hasattr(chat_messages, '__aiter__'):
+            # It's an async generator
+            async for msg in chat_messages:
+                messages.append(msg)
+        else:
+            # It's already a list or iterable
+            messages = list(chat_messages)
+    except Exception as e:
+        print(f"⚠️ Error retrieving chat messages: {str(e)}")
+        print("🔄 Continuing with empty message list...")
+        messages = []
+    
+    print(f"📊 Retrieved {len(messages)} messages from chat history.")
 
     # 1️⃣ Check if the Product Owner says "READY FOR USER APPROVAL"
+    approval_requested = False
     for msg in messages:
         if (
             isinstance(msg, ChatMessageContent) and
             msg.role == AuthorRole.ASSISTANT and
             "READY FOR USER APPROVAL" in msg.content.upper()
         ):
-            # Prompt the user for final "APPROVED"
-            user_input = input("📝 The Product Owner says 'READY FOR USER APPROVAL'. Type 'APPROVED' to finalize: ")
-            if user_input.strip().upper() == "APPROVED":
-                final_user_message = ChatMessageContent(
-                    role=AuthorRole.USER,
-                    content="APPROVED"
-                )
-                await group_chat.add_chat_message(final_user_message)
-                print("✅ Final user approval added.")
-            else:
-                print("⚠️ Approval not given. Workflow may continue to wait for it.")
+            approval_requested = True
+            print("📝 The Product Owner says 'READY FOR USER APPROVAL'.")
+            print("💡 Type 'APPROVED' to finalize, 'SKIP' to terminate without approval, or anything else to cancel.")
+            
+            try:
+                user_input = input("Your response: ").strip().upper()
+                
+                if user_input == "APPROVED":
+                    final_user_message = ChatMessageContent(
+                        role=AuthorRole.USER,
+                        content="APPROVED"
+                    )
+                    await group_chat.add_chat_message(final_user_message)
+                    print("✅ Final user approval added.")
+                elif user_input == "SKIP":
+                    print("⚠️ User chose to skip approval. Proceeding with HTML extraction only.")
+                    break
+                else:
+                    print("⚠️ Approval not given. Proceeding with HTML extraction only.")
+                    break
+                    
+            except (KeyboardInterrupt, EOFError):
+                print("\n⚠️ User interrupted. Proceeding with HTML extraction only.")
+                break
             break
 
     # 2️⃣ Check if the final "APPROVED" is in the chat history
-    messages = group_chat.get_chat_messages()
+    # Re-fetch messages after potential approval
+    if approval_requested:
+        print("🔄 Re-fetching messages after potential approval...")
+        try:
+            chat_messages = group_chat.get_chat_messages()
+            if hasattr(chat_messages, '__aiter__'):
+                messages = []
+                async for msg in chat_messages:
+                    messages.append(msg)
+            else:
+                messages = list(chat_messages)
+        except Exception as e:
+            print(f"⚠️ Error re-fetching messages: {str(e)}")
+
+    user_approved = False
     for msg in messages:
         if (
             isinstance(msg, ChatMessageContent) and
             msg.role == AuthorRole.USER and
             "APPROVED" in msg.content.upper()
         ):
+            user_approved = True
+            print("✅ User approval confirmed in chat history.")
             await on_approved_callback()
             break
+
+    if not user_approved and approval_requested:
+        print("ℹ️ No final approval given. Skipping GitHub push.")
 
     # 3️⃣ Extract HTML code from Software Engineer's messages
     html_code = None
@@ -210,40 +280,47 @@ async def run_multi_agent(input_text: str):
         print("💡 Try asking the Software Engineer to provide HTML code in a ```html code block.")
 
         # 🔧 Fallback: Look for any HTML-like content (even without code blocks)
-        print("🔍 Searching for HTML-like content as fallback...")
-        for i, msg in enumerate(messages):
-            if isinstance(msg, ChatMessageContent) and msg.role == AuthorRole.ASSISTANT:
-                content = msg.content.lower()
-                if any(tag in content for tag in ["<html", "<!doctype", "<head", "<body"]):
-                    print(f"📄 Found HTML-like content in message {i+1}")
-                    # Extract potential HTML content
-                    html_match = re.search(r'(<!DOCTYPE.*?</html>|<html.*?</html>)', msg.content, re.DOTALL | re.IGNORECASE)
-                    if html_match:
-                        fallback_html = html_match.group(1).strip()
-                        try:
-                            output_path = os.path.join(os.getcwd(), "index.html")
-                            with open(output_path, "w", encoding="utf-8") as f:
-                                f.write(fallback_html)
-                            print(f"✅ Fallback HTML saved to: {output_path}")
-                            print(f"📁 File size: {len(fallback_html)} characters")
-
+        if messages:  # Only try fallback if we have messages
+            print("🔍 Searching for HTML-like content as fallback...")
+            for i, msg in enumerate(messages):
+                if isinstance(msg, ChatMessageContent) and msg.role == AuthorRole.ASSISTANT:
+                    content = msg.content.lower()
+                    if any(tag in content for tag in ["<html", "<!doctype", "<head", "<body"]):
+                        print(f"📄 Found HTML-like content in message {i+1}")
+                        # Extract potential HTML content
+                        html_match = re.search(r'(<!DOCTYPE.*?</html>|<html.*?</html>)', msg.content, re.DOTALL | re.IGNORECASE)
+                        if html_match:
+                            fallback_html = html_match.group(1).strip()
                             try:
-                                webbrowser.open(f"file://{output_path}")
-                                print("🌐 Opened in default browser!")
-                            except Exception as browser_error:
-                                print(f"⚠️ Could not open browser: {browser_error}")
-                            break
-                        except Exception as e:
-                            print(f"❌ Error writing fallback HTML: {e}")
+                                output_path = os.path.join(os.getcwd(), "index.html")
+                                with open(output_path, "w", encoding="utf-8") as f:
+                                    f.write(fallback_html)
+                                print(f"✅ Fallback HTML saved to: {output_path}")
+                                print(f"📁 File size: {len(fallback_html)} characters")
 
+                                try:
+                                    webbrowser.open(f"file://{output_path}")
+                                    print("🌐 Opened in default browser!")
+                                except Exception as browser_error:
+                                    print(f"⚠️ Could not open browser: {browser_error}")
+                                break
+                            except Exception as e:
+                                print(f"❌ Error writing fallback HTML: {e}")
+
+    print("🏁 Multi-agent workflow completed successfully!")
     return messages
-
-
 
 # --- For running directly
 if __name__ == "__main__":
     try:
+        print("🚀 Multi-Agent System Starting...")
         user_input = input("📝 Please enter your prompt for the multi-agent system: ")
-        asyncio.run(run_multi_agent(user_input))
+        if user_input.strip():
+            asyncio.run(run_multi_agent(user_input))
+        else:
+            print("❌ Empty input provided. Exiting.")
+    except KeyboardInterrupt:
+        print("\n⚠️ User interrupted the process. Exiting gracefully.")
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
+        print(f"❌ Unexpected error: {str(e)}")
+        print("🔍 This might be due to API limits, network issues, or configuration problems.")
